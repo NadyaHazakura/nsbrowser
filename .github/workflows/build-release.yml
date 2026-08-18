@@ -1,0 +1,159 @@
+name: NS Browser - Build & Publish APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      chromium_revision:
+        description: "Chromium commit/tag to build"
+        required: true
+        default: "main"
+      publish_release:
+        description: "Publish GitHub Release"
+        required: true
+        type: boolean
+        default: true
+  push:
+    tags:
+      - "ns-v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ns-browser-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+
+    env:
+      CHROMIUM_REVISION: ${{ inputs.chromium_revision || 'main' }}
+      DEPOT_TOOLS: ${{ github.workspace }}/depot_tools
+      CHROMIUM_ROOT: ${{ github.workspace }}/chromium
+      OUT_DIR: ${{ github.workspace }}/chromium/src/out/NSBrowser
+
+    steps:
+      - name: Checkout NS Browser patches
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: |
+          df -h
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
+          df -h
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git python3 curl unzip
+
+      - name: Cache depot_tools
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.DEPOT_TOOLS }}
+          key: depot-tools-${{ runner.os }}-${{ hashFiles('.github/workflows/build-release.yml') }}
+
+      - name: Checkout depot_tools
+        run: |
+          if [ ! -d "$DEPOT_TOOLS/.git" ]; then
+            git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$DEPOT_TOOLS"
+          else
+            git -C "$DEPOT_TOOLS" pull --ff-only
+          fi
+          echo "$DEPOT_TOOLS" >> "$GITHUB_PATH"
+
+      - name: Fetch Chromium
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$CHROMIUM_ROOT"
+          cd "$CHROMIUM_ROOT"
+
+          if [ ! -f .gclient ]; then
+            fetch --nohooks android
+          fi
+
+          cd src
+          git fetch --tags --prune origin
+          if git rev-parse --verify "$CHROMIUM_REVISION^{commit}" >/dev/null 2>&1; then
+            git checkout --detach "$CHROMIUM_REVISION"
+          else
+            git fetch origin "$CHROMIUM_REVISION"
+            git checkout --detach "$CHROMIUM_REVISION"
+          fi
+
+          cd ..
+          gclient sync --nohooks --reset --force -D
+          cd src
+
+      - name: Install Chromium Android dependencies
+        run: |
+          cd "$CHROMIUM_ROOT/src"
+          build/install-build-deps.sh --android
+
+      - name: Run Chromium hooks
+        run: |
+          cd "$CHROMIUM_ROOT/src"
+          gclient runhooks
+
+      - name: Apply NS Browser patches
+        run: |
+          cd "$CHROMIUM_ROOT/src"
+          if [ -f "$GITHUB_WORKSPACE/patches/ns-browser.patch" ]; then
+            git apply --check "$GITHUB_WORKSPACE/patches/ns-browser.patch"
+            git apply "$GITHUB_WORKSPACE/patches/ns-browser.patch"
+          else
+            echo "No NS Browser patch file yet; building upstream Chromium."
+          fi
+
+      - name: Configure ARM64 release
+        run: |
+          cd "$CHROMIUM_ROOT/src"
+          mkdir -p "$OUT_DIR"
+          cat > "$OUT_DIR/args.gn" <<'EOF'
+          target_os = "android"
+          target_cpu = "arm64"
+          is_debug = false
+          is_official_build = true
+          is_component_build = false
+          symbol_level = 0
+          enable_nacl = false
+          remove_webcore_debug_symbols = true
+          use_thin_lto = true
+          android_channel = "stable"
+          EOF
+          gn gen "$OUT_DIR"
+
+      - name: Build NS Browser
+        run: |
+          cd "$CHROMIUM_ROOT/src"
+          autoninja -C "$OUT_DIR" chrome_public_apk
+
+      - name: Locate and validate APK
+        run: |
+          set -euxo pipefail
+          APK="$(find "$OUT_DIR" -type f -name '*.apk' | head -n 1)"
+          test -n "$APK"
+          mkdir -p "$GITHUB_WORKSPACE/release"
+          cp "$APK" "$GITHUB_WORKSPACE/release/NS-Browser-arm64-v8a.apk"
+          file "$GITHUB_WORKSPACE/release/NS-Browser-arm64-v8a.apk"
+          ls -lh "$GITHUB_WORKSPACE/release/NS-Browser-arm64-v8a.apk"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NS-Browser-arm64-v8a
+          path: release/NS-Browser-arm64-v8a.apk
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: ${{ github.event_name == 'push' || inputs.publish_release == true }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name != '' && github.ref_name || format('ns-v{0}', github.run_number) }}
+          name: NS Browser ${{ github.ref_name != '' && github.ref_name || format('build {0}', github.run_number) }}
+          generate_release_notes: true
+          files: release/NS-Browser-arm64-v8a.apk
+          
