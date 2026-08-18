@@ -1,0 +1,8 @@
+chromium/
+depot_tools/
+release/
+out/
+*.apk
+*.aab
+*.keystore
+*.jks
